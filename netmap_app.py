@@ -247,10 +247,10 @@ if __name__ == "__main__":
 # ===================== TrustPoint Patch & Vulnerability report =====================
 # Added alongside the network-map service. POST /patch-report (JSON):
 #   { "customer": "...",
-#     "devices": [[device, os, crit, imp, mod, low, apps, lastScanned], ...],
-#     "details": [[device, os, type, ref, title, severity, releaseDate, available, lastScanned], ...] }
-# -> 200 xlsx (per-customer graphical report). Protected by X-Api-Key (RENDER_KEY) like /render.
-import tempfile
+#     "summary":    [ {hostName, os, scanTimeUtc, critical, important, moderate, low, appCount}, ... ],
+#     "detections": [ {hostName, os, itemType, ref, title, severity, releaseDate, available, scanTimeUtc}, ... ] }
+# -> 200 xlsx  (or JSON {filename, dataB64} when called with ?b64=1). X-Api-Key (RENDER_KEY) like /render.
+import tempfile, base64
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as _plt
@@ -266,15 +266,18 @@ _LIGHT="EEF2FB"; _WHITE="FFFFFF"; _FONT="Arial"
 _thin=_SD(style="thin",color="D5DBE8"); _bd=_BD(left=_thin,right=_thin,top=_thin,bottom=_thin)
 _sevc={"Critical":_CRIT,"Important":_IMP,"Moderate":_MOD,"Low":_LOW,"App updates":_APPC}
 def _hx(c): return "#"+c
+def _i(v):
+    try: return int(float(v))
+    except Exception: return 0
 
 def _rdonut(sev,total,path):
     labels=[k for k,v in sev]; vals=[v for k,v in sev]; colors=[_hx(_sevc[k]) for k in labels]
     fig,ax=_plt.subplots(figsize=(6.4,3.3),dpi=110)
-    w,_=ax.pie(vals,colors=colors,startangle=90,counterclock=False,wedgeprops=dict(width=0.42,edgecolor="white",linewidth=1.5))
+    w,_=ax.pie(vals if any(vals) else [1],colors=colors if any(vals) else ["#DDDDDD"],startangle=90,counterclock=False,wedgeprops=dict(width=0.42,edgecolor="white",linewidth=1.5))
     ax.set(aspect="equal")
     ax.text(0,0,str(total)+"\nitems",ha="center",va="center",fontsize=15,fontweight="bold",color=_hx(_NAVY))
     leg=[labels[i]+"   "+str(vals[i])+"  ("+(f"{(vals[i]/total*100):.1f}" if total else "0.0")+"%)" for i in range(len(labels))]
-    ax.legend(w,leg,loc="center left",bbox_to_anchor=(1.0,0.5),frameon=False,fontsize=10.5)
+    ax.legend(w[:len(labels)],leg,loc="center left",bbox_to_anchor=(1.0,0.5),frameon=False,fontsize=10.5)
     _plt.subplots_adjust(left=0.02,right=0.62,top=0.98,bottom=0.02)
     fig.savefig(path,dpi=110,facecolor="white"); _plt.close(fig)
 
@@ -290,9 +293,14 @@ def _rbars(topdev,path):
     _plt.subplots_adjust(left=0.28,right=0.98,top=0.98,bottom=0.14)
     fig.savefig(path,dpi=110,facecolor="white"); _plt.close(fig)
 
-def build_patch_report(customer, devices, details):
+def build_patch_report(customer, summary, detections):
     import datetime as _dt
     report_date=_dt.datetime.now().strftime("%B %d, %Y")
+    devices=[[s.get("hostName",""), s.get("os",""), _i(s.get("critical")), _i(s.get("important")),
+              _i(s.get("moderate")), _i(s.get("low")), _i(s.get("appCount")), s.get("scanTimeUtc","")] for s in summary]
+    details=[[d.get("hostName",""), d.get("os",""), d.get("itemType",""), d.get("ref",""), d.get("title",""),
+              d.get("severity","Unspecified") or "Unspecified", d.get("releaseDate","") or "",
+              d.get("available","") or "", d.get("scanTimeUtc","")] for d in detections]
     tc=sum(d[2] for d in devices); ti=sum(d[3] for d in devices); tm=sum(d[4] for d in devices)
     tl=sum(d[5] for d in devices); ta=sum(d[6] for d in devices); tall=tc+ti+tm+tl+ta
     ranked=sorted(devices,key=lambda d:(d[2]+d[3]+d[4]+d[5]+d[6]),reverse=True)
@@ -300,7 +308,7 @@ def build_patch_report(customer, devices, details):
     topdev=ranked[:12]
     dp=tempfile.NamedTemporaryFile(suffix=".png",delete=False).name
     bp=tempfile.NamedTemporaryFile(suffix=".png",delete=False).name
-    _rdonut(sev,tall,dp); _rbars(topdev,bp)
+    _rdonut(sev,tall,dp); _rbars(topdev if topdev else [["(no devices)","",0,0,0,0,0,""]],bp)
     wb=_WB(); ws=wb.active; ws.title="Summary"; ws.sheet_view.showGridLines=False
     for c in range(1,16): ws.column_dimensions[_gcl(c)].width=11
     ws.merge_cells("A1:O2"); t=ws["A1"]; t.value=customer+"  -  Patch & Vulnerability Report"
@@ -396,10 +404,12 @@ def patch_report():
         return jsonify(error="unauthorized"), 401
     body = request.get_json(force=True)
     customer = body.get("customer", "Client")
-    devices = body.get("devices", [])
-    details = body.get("details", [])
-    if not devices:
+    summary = body.get("summary", [])
+    detections = body.get("detections", [])
+    if not summary:
         return jsonify(error="no devices provided"), 400
-    buf = build_patch_report(customer, devices, details)
-    return send_file(buf, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                     download_name=re.sub(r"\W+", "_", customer) + "_patch_report.xlsx")
+    buf = build_patch_report(customer, summary, detections)
+    fname = re.sub(r"\W+", "_", customer) + "_patch_report.xlsx"
+    if request.args.get("b64"):
+        return jsonify(filename=fname, dataB64=base64.b64encode(buf.getvalue()).decode())
+    return send_file(buf, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", download_name=fname)
