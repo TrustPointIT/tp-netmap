@@ -60,6 +60,99 @@ def parse_ports(v):
         return {int(x) for x in v if str(x).isdigit()}
     return {int(m) for m in re.findall(r"\((\d+)/", v or "")}
 
+def _valid_ip(ip):
+    ip = (ip or "").strip()
+    try:
+        ipaddress.ip_address(ip)
+        return ip not in ("0.0.0.0",)
+    except Exception:
+        return False
+
+def _parse_date(s):
+    for fmt in ("%Y-%m-%d", "%Y-%m", "%m/%d/%Y", "%Y/%m/%d"):
+        try:
+            return datetime.datetime.strptime(str(s)[:10], fmt).date()
+        except Exception:
+            continue
+    return None
+
+EXPOSURE_PORTS = {22, 23, 21, 3389, 5900}
+
+def assemble(body):
+    """
+    Merge the three IT Glue / N-central sources into one device list plus a
+    findings summary and a decommission (stale-AD) list. Join key is the IP:
+    an N-central agent IP == a Network Glue discovered IP means the same device
+    (so it's managed and we can promote the real hostname).
+
+    Accepts:
+      ncentral: [{name,class,ip,gw,dns,dhcp,mac,os}, ...]  (agent-managed)
+      nonad:    [{ip,ports}, ...]                          (Network Glue scan)
+      ad:       [{name,enabled,last}, ...]                 (Network Glue AD)
+    Falls back to body['devices'] (flat, unmanaged-agnostic) when no ncentral.
+    """
+    ncentral = body.get("ncentral") or body.get("devices") or []
+    nonad = body.get("nonad") or []
+    ad = body.get("ad") or []
+    stale_days = int(body.get("stale_days", 365))
+    today = datetime.date.today()
+
+    managed_ips, host_by_ip = set(), {}
+    for d in ncentral:
+        ip = (d.get("ip") or "").strip()
+        if _valid_ip(ip):
+            managed_ips.add(ip)
+            host_by_ip.setdefault(ip, d.get("name"))
+
+    devices, nonad_ips = [], set()
+    for d in nonad:
+        ip = (d.get("ip") or "").strip()
+        if not _valid_ip(ip):
+            continue
+        nonad_ips.add(ip)
+        devices.append({
+            "name": host_by_ip.get(ip) or ip,
+            "ip": ip,
+            "class": "",
+            "ports": d.get("ports"),
+            "managed": ip in managed_ips,
+        })
+    for d in ncentral:
+        ip = (d.get("ip") or "").strip()
+        if not _valid_ip(ip) or ip in nonad_ips:
+            continue
+        dd = dict(d)
+        dd["managed"] = True
+        devices.append(dd)
+
+    # Stale AD (enabled, no login for >= stale_days)
+    stale = []
+    for a in ad:
+        en = a.get("enabled")
+        if str(en).lower() != "true":
+            continue
+        dt = _parse_date(a.get("last"))
+        if dt and (today - dt).days >= stale_days:
+            host = (a.get("name") or "").split("\\")[-1]
+            stale.append((host, str(a.get("last"))))
+    stale.sort(key=lambda x: x[1])
+
+    # Findings
+    managed_ct = sum(1 for d in devices if d.get("managed"))
+    disc = len(devices) - managed_ct
+    exposed = sum(1 for d in nonad
+                  if EXPOSURE_PORTS & parse_ports(d.get("ports")))
+    findings = []
+    if devices:
+        findings.append("Coverage: %d managed / %d discovered-unmanaged"
+                        % (managed_ct, disc))
+    if stale:
+        findings.append("Stale AD (>%dd): %d decommission candidates"
+                        % (stale_days, len(stale)))
+    if exposed:
+        findings.append("Legacy exposure: %d hosts on SSH/Telnet/FTP/RDP" % exposed)
+    return devices, findings, stale
+
 def classify(name, cls, ports=None):
     n = (name or "").upper(); c = cls or ""
     if "FW" in n or "FIREWALL" in n: return "firewall"
@@ -131,7 +224,7 @@ def _node(d, dns_ips, suffix):
     return nidn, ('  %s [label="%s", fillcolor="%s", fontcolor="%s", style="%s"];'
                   % (nidn, "\\n".join(lines), col, fc, style))
 
-def build_dot(client, devices, date, findings=None):
+def build_dot(client, devices, date, findings=None, stale=None):
     for d in devices:
         d["_ports"] = parse_ports(d.get("ports") or d.get("listening_ports"))
         d["role"] = classify(d.get("name"), d.get("class"), d["_ports"])
@@ -196,6 +289,25 @@ def build_dot(client, devices, date, findings=None):
             L.append('    %s -> %s;' % (anchor, rows[0][0]))
         L.append('  }')
         L.append('  %s -> %s [lhead=cluster_seg%d, color="#b3261e", penwidth=1.4];' % (fw_anchor, anchor, idx))
+
+    if stale:
+        L.append('  subgraph cluster_stale {')
+        L.append('    label="DECOMMISSION CANDIDATES  -  enabled in AD, no login >1yr"; '
+                 'style="dashed"; color="#b3261e"; fontsize=11; fontcolor="#b3261e";')
+        sids = []
+        for i, (nm, last) in enumerate(stale):
+            sid = "stale%d" % i
+            L.append('    %s [label="%s\\n%s", fillcolor="#f3d9d6", fontcolor="#7a1f2b", shape=box];'
+                     % (sid, esc(nm), esc(last)))
+            sids.append(sid)
+        srows = [sids[i:i + 8] for i in range(0, len(sids), 8)]
+        for row in srows:
+            L.append("    {rank=same; " + " ".join(row) + "}")
+            for j in range(len(row) - 1):
+                L.append('    %s -> %s [style=invis];' % (row[j], row[j + 1]))
+        for r in range(len(srows) - 1):
+            L.append('    %s -> %s [style=invis];' % (srows[r][0], srows[r + 1][0]))
+        L.append('  }')
 
     if noip:
         L.append('  subgraph cluster_noip {')
@@ -266,17 +378,13 @@ def render():
     body = request.get_json(force=True)
     client = body.get("client", "Client")
     date = body.get("date") or datetime.datetime.now().strftime("%Y-%m-%d")
-    devices = body.get("devices", [])
+    # Enriched mode: merge ncentral + Network Glue nonad + ad server-side.
+    devices, findings, stale = assemble(body)
     if not devices:
         return jsonify(error="no devices provided"), 400
-    # Findings: caller may pass explicit lines; otherwise derive the coverage gap.
-    findings = list(body.get("findings") or [])
-    if not findings:
-        managed = sum(1 for d in devices if d.get("managed", True))
-        disc = len(devices) - managed
-        if disc:
-            findings.append("Coverage: %d managed / %d discovered-unmanaged" % (managed, disc))
-    dot = build_dot(client, devices, date, findings)
+    if body.get("findings"):          # allow caller-supplied override lines
+        findings = list(body["findings"])
+    dot = build_dot(client, devices, date, findings, stale)
     p = subprocess.run(["dot", "-Tpng", "-Gdpi=110"], input=dot.encode(),
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if p.returncode != 0:
