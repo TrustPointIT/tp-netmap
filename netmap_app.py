@@ -34,26 +34,48 @@ ROLE_COLOR = {
     "nas": ("#6d2e46", "white"), "hyperv": ("#2c5f2d", "white"),
     "server": ("#1E2761", "white"), "printer": ("#8d6e8f", "white"),
     "endpoint": ("#cfe0f5", "#1E2761"), "laptop": ("#e2ecf9", "#1E2761"),
+    # Network Glue port-fingerprinted roles
+    "oracle": ("#8a3b00", "white"), "sql": ("#7a1f2b", "white"),
+    "dns": ("#155e63", "white"), "linux": ("#33475b", "white"),
+    "web": ("#3a4a2f", "white"),
     "other": ("#b8b8b8", "#222222"),
 }
 ROLE_NAMES = {
     "firewall": "FIREWALL", "switch": "SWITCH", "network": "ROUTER / SWITCH",
     "accesspoint": "ACCESS POINT", "nas": "NAS / STORAGE", "hyperv": "HYPER-V HOST",
     "server": "SERVER", "printer": "PRINTER", "endpoint": "WORKSTATION",
-    "laptop": "LAPTOP", "other": "DEVICE",
+    "laptop": "LAPTOP", "oracle": "ORACLE DB", "sql": "SQL SERVER",
+    "dns": "DNS / GATEWAY", "linux": "LINUX / SSH HOST", "web": "WEB / HTTPS",
+    "other": "DEVICE",
 }
 
-def classify(name, cls):
+# Port -> role (Network Glue "listening-ports"). First match wins.
+PORT_ROLE = [(1521, "oracle"), (1433, "sql"), (53, "dns"),
+             (9100, "printer"), (515, "printer"), (631, "printer"),
+             (22, "linux"), (443, "web"), (8080, "web"), (80, "web")]
+
+def parse_ports(v):
+    """Accept [22,80] or 'SSH (22/TCP),HTTP (8080/TCP)' -> set of ints."""
+    if isinstance(v, (list, tuple)):
+        return {int(x) for x in v if str(x).isdigit()}
+    return {int(m) for m in re.findall(r"\((\d+)/", v or "")}
+
+def classify(name, cls, ports=None):
     n = (name or "").upper(); c = cls or ""
     if "FW" in n or "FIREWALL" in n: return "firewall"
     if "-AP" in n or "ACCESSPOINT" in n or "ACCESS POINT" in n or "-WAP" in n: return "accesspoint"
     if c == "Switch/Router" and "SW" in n: return "switch"
     if c == "Switch/Router": return "network"
-    if c == "Printer" or "PRINT" in n: return "printer"
+    if c == "Printer" or "PRINT" in n or n.startswith("RNP"): return "printer"
     if c == "Storage": return "nas"
     if c.startswith("Servers"): return "hyperv" if "HV" in n else "server"
     if c.startswith("Laptop"): return "laptop"
     if c.startswith("Workstations"): return "endpoint"
+    # No N-central class (discovered-only device): fingerprint by listening ports
+    ps = ports or set()
+    for port, role in PORT_ROLE:
+        if port in ps:
+            return role
     return "other"
 
 def subnet_of(ip):
@@ -99,12 +121,20 @@ def _node(d, dns_ips, suffix):
     os_s = esc((d.get("os") or "").replace("Microsoft ", ""))
     if os_s: lines.append(os_s)
     if d.get("mac"): lines.append(esc(d["mac"]))
+    # Managed-vs-discovered is the coverage signal from IT Glue/N-central.
+    # Discovered-but-unmanaged devices get a dashed border + a tag line.
+    managed = d.get("managed", True)
+    style = "filled,rounded" if managed else "filled,rounded,dashed"
+    if not managed:
+        lines.append("(DISCOVERED - unmanaged)")
     nidn = nid(d["name"] + "_" + suffix)
-    return nidn, '  %s [label="%s", fillcolor="%s", fontcolor="%s"];' % (nidn, "\\n".join(lines), col, fc)
+    return nidn, ('  %s [label="%s", fillcolor="%s", fontcolor="%s", style="%s"];'
+                  % (nidn, "\\n".join(lines), col, fc, style))
 
-def build_dot(client, devices, date):
+def build_dot(client, devices, date, findings=None):
     for d in devices:
-        d["role"] = classify(d.get("name"), d.get("class"))
+        d["_ports"] = parse_ports(d.get("ports") or d.get("listening_ports"))
+        d["role"] = classify(d.get("name"), d.get("class"), d["_ports"])
         d["ip"] = (d.get("ip") or "").strip()
         d["sub"] = subnet_of(d["ip"]) if d["ip"] else None
     dns_ips = _dns_ips(devices)
@@ -121,6 +151,14 @@ def build_dot(client, devices, date):
          '  node [fontname="Helvetica", fontsize=9, style="filled,rounded", shape=box];',
          '  edge [color="#8a8a8a", arrowhead=none];',
          '  internet [label="INTERNET", shape=ellipse, fillcolor="#dddddd", fontcolor="#000000"];']
+
+    # Findings panel (coverage gap / stale AD / exposure) from Network Glue data.
+    if findings:
+        ftext = "\\l".join(esc(x) for x in findings) + "\\l"
+        L.append('  findings [label="NETWORK FINDINGS\\l%s", shape=note, '
+                 'fillcolor="#fff6e6", fontcolor="#5a3b00", fontsize=10, '
+                 'style="filled"];' % ftext)
+        L.append('  {rank=source; internet; findings}')
 
     fw_anchor = "internet"
     for i, fw in enumerate(fws):
@@ -231,7 +269,14 @@ def render():
     devices = body.get("devices", [])
     if not devices:
         return jsonify(error="no devices provided"), 400
-    dot = build_dot(client, devices, date)
+    # Findings: caller may pass explicit lines; otherwise derive the coverage gap.
+    findings = list(body.get("findings") or [])
+    if not findings:
+        managed = sum(1 for d in devices if d.get("managed", True))
+        disc = len(devices) - managed
+        if disc:
+            findings.append("Coverage: %d managed / %d discovered-unmanaged" % (managed, disc))
+    dot = build_dot(client, devices, date, findings)
     p = subprocess.run(["dot", "-Tpng", "-Gdpi=110"], input=dot.encode(),
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if p.returncode != 0:
@@ -242,174 +287,3 @@ def render():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
-
-
-# ===================== TrustPoint Patch & Vulnerability report =====================
-# Added alongside the network-map service. POST /patch-report (JSON):
-#   { "customer": "...",
-#     "summary":    [ {hostName, os, scanTimeUtc, critical, important, moderate, low, appCount}, ... ],
-#     "detections": [ {hostName, os, itemType, ref, title, severity, releaseDate, available, scanTimeUtc}, ... ] }
-# -> 200 xlsx  (or JSON {filename, dataB64} when called with ?b64=1). X-Api-Key (RENDER_KEY) like /render.
-import tempfile, base64
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as _plt
-from openpyxl import Workbook as _WB
-from openpyxl.styles import Font as _F, PatternFill as _PF, Alignment as _AL, Border as _BD, Side as _SD
-from openpyxl.utils import get_column_letter as _gcl
-from openpyxl.worksheet.properties import PageSetupProperties as _PSP
-from openpyxl.drawing.image import Image as _XLImage
-
-_NAVY="1F2A44"; _BLUE="2E5BFF"; _SLATE="5B6B8C"
-_CRIT="C0392B"; _IMP="E67E22"; _MOD="F1C40F"; _LOW="27AE60"; _APPC="2E86C1"
-_LIGHT="EEF2FB"; _WHITE="FFFFFF"; _FONT="Arial"
-_thin=_SD(style="thin",color="D5DBE8"); _bd=_BD(left=_thin,right=_thin,top=_thin,bottom=_thin)
-_sevc={"Critical":_CRIT,"Important":_IMP,"Moderate":_MOD,"Low":_LOW,"App updates":_APPC}
-def _hx(c): return "#"+c
-def _i(v):
-    try: return int(float(v))
-    except Exception: return 0
-
-def _rdonut(sev,total,path):
-    labels=[k for k,v in sev]; vals=[v for k,v in sev]; colors=[_hx(_sevc[k]) for k in labels]
-    fig,ax=_plt.subplots(figsize=(6.4,3.3),dpi=110)
-    w,_=ax.pie(vals if any(vals) else [1],colors=colors if any(vals) else ["#DDDDDD"],startangle=90,counterclock=False,wedgeprops=dict(width=0.42,edgecolor="white",linewidth=1.5))
-    ax.set(aspect="equal")
-    ax.text(0,0,str(total)+"\nitems",ha="center",va="center",fontsize=15,fontweight="bold",color=_hx(_NAVY))
-    leg=[labels[i]+"   "+str(vals[i])+"  ("+(f"{(vals[i]/total*100):.1f}" if total else "0.0")+"%)" for i in range(len(labels))]
-    ax.legend(w[:len(labels)],leg,loc="center left",bbox_to_anchor=(1.0,0.5),frameon=False,fontsize=10.5)
-    _plt.subplots_adjust(left=0.02,right=0.62,top=0.98,bottom=0.02)
-    fig.savefig(path,dpi=110,facecolor="white"); _plt.close(fig)
-
-def _rbars(topdev,path):
-    names=[d[0] for d in topdev][::-1]; totals=[d[2]+d[3]+d[4]+d[5]+d[6] for d in topdev][::-1]; n=len(names)
-    fig,ax=_plt.subplots(figsize=(9.2,max(1.6,0.46*n+0.7)),dpi=110)
-    ax.barh(range(n),totals,color=_hx(_BLUE),height=0.62)
-    ax.set_yticks(range(n)); ax.set_yticklabels(names,fontsize=10.5,color=_hx(_NAVY)); ax.tick_params(axis="y",length=0)
-    ax.tick_params(axis="x",labelsize=9,colors=_hx(_SLATE))
-    for s in ("top","right","left"): ax.spines[s].set_visible(False)
-    ax.spines["bottom"].set_color(_hx("D5DBE8")); mx=max(totals) if totals else 1; ax.set_xlim(0,mx*1.12)
-    for i,v in enumerate(totals): ax.text(v+mx*0.015,i,str(v),va="center",ha="left",fontsize=9.5,color=_hx(_NAVY))
-    _plt.subplots_adjust(left=0.28,right=0.98,top=0.98,bottom=0.14)
-    fig.savefig(path,dpi=110,facecolor="white"); _plt.close(fig)
-
-def build_patch_report(customer, summary, detections):
-    import datetime as _dt
-    report_date=_dt.datetime.now().strftime("%B %d, %Y")
-    devices=[[s.get("hostName",""), s.get("os",""), _i(s.get("critical")), _i(s.get("important")),
-              _i(s.get("moderate")), _i(s.get("low")), _i(s.get("appCount")), s.get("scanTimeUtc","")] for s in summary]
-    details=[[d.get("hostName",""), d.get("os",""), d.get("itemType",""), d.get("ref",""), d.get("title",""),
-              d.get("severity","Unspecified") or "Unspecified", d.get("releaseDate","") or "",
-              d.get("available","") or "", d.get("scanTimeUtc","")] for d in detections]
-    tc=sum(d[2] for d in devices); ti=sum(d[3] for d in devices); tm=sum(d[4] for d in devices)
-    tl=sum(d[5] for d in devices); ta=sum(d[6] for d in devices); tall=tc+ti+tm+tl+ta
-    ranked=sorted(devices,key=lambda d:(d[2]+d[3]+d[4]+d[5]+d[6]),reverse=True)
-    sev=[("Critical",tc),("Important",ti),("Moderate",tm),("Low",tl),("App updates",ta)]
-    topdev=ranked[:12]
-    dp=tempfile.NamedTemporaryFile(suffix=".png",delete=False).name
-    bp=tempfile.NamedTemporaryFile(suffix=".png",delete=False).name
-    _rdonut(sev,tall,dp); _rbars(topdev if topdev else [["(no devices)","",0,0,0,0,0,""]],bp)
-    wb=_WB(); ws=wb.active; ws.title="Summary"; ws.sheet_view.showGridLines=False
-    for c in range(1,16): ws.column_dimensions[_gcl(c)].width=11
-    ws.merge_cells("A1:O2"); t=ws["A1"]; t.value=customer+"  -  Patch & Vulnerability Report"
-    t.font=_F(name=_FONT,size=18,bold=True,color=_WHITE); t.alignment=_AL(horizontal="left",vertical="center",indent=1)
-    for row in ws["A1:O2"]:
-        for cell in row: cell.fill=_PF("solid",fgColor=_NAVY)
-    ws.merge_cells("A3:O3"); s=ws["A3"]
-    s.value="Week of "+report_date+"    -    Source: on-device Windows Update + winget scan (machine-sourced, accurate)"
-    s.font=_F(name=_FONT,size=10,italic=True,color=_SLATE); s.alignment=_AL(horizontal="left",indent=1)
-    kpis=[("Devices scanned",len(devices),_BLUE),("Total missing",tall,_NAVY),("Critical",tc,_CRIT),("Important",ti,_IMP),("App updates",ta,_APPC)]
-    col=1
-    for label,val,color in kpis:
-        ws.merge_cells(start_row=5,start_column=col,end_row=5,end_column=col+1)
-        ws.merge_cells(start_row=6,start_column=col,end_row=7,end_column=col+1)
-        lc=ws.cell(row=5,column=col,value=label); lc.font=_F(name=_FONT,size=9,bold=True,color=_WHITE); lc.alignment=_AL(horizontal="center")
-        vc=ws.cell(row=6,column=col,value=val); vc.font=_F(name=_FONT,size=22,bold=True,color=_WHITE); vc.alignment=_AL(horizontal="center",vertical="center")
-        for r in (5,6,7):
-            for cc in (col,col+1): ws.cell(row=r,column=cc).fill=_PF("solid",fgColor=color)
-        col+=2
-    ws.merge_cells("A9:E9"); ws["A9"].value="Missing items by severity"; ws["A9"].font=_F(name=_FONT,size=12,bold=True,color=_NAVY)
-    ws.merge_cells("H9:J9"); ws["H9"].value="Breakdown"; ws["H9"].font=_F(name=_FONT,size=12,bold=True,color=_NAVY)
-    im=_XLImage(dp); im.width=470; im.height=242; ws.add_image(im,"A10")
-    for i,h in enumerate(["Severity","Count","Share"],start=8):
-        cell=ws.cell(row=10,column=i,value=h); cell.font=_F(name=_FONT,size=10,bold=True,color=_WHITE)
-        cell.fill=_PF("solid",fgColor=_NAVY); cell.alignment=_AL(horizontal="center"); cell.border=_bd
-    r=11
-    for k,v in sev:
-        kc=ws.cell(row=r,column=8,value=k); kc.font=_F(name=_FONT,size=10,bold=True,color=_WHITE)
-        kc.fill=_PF("solid",fgColor=_sevc[k]); kc.alignment=_AL(horizontal="left",indent=1); kc.border=_bd
-        vc=ws.cell(row=r,column=9,value=v); vc.font=_F(name=_FONT,size=10,color=_NAVY); vc.alignment=_AL(horizontal="center"); vc.border=_bd
-        pc=ws.cell(row=r,column=10,value="=I"+str(r)+"/I16"); pc.number_format="0.0%"
-        pc.font=_F(name=_FONT,size=10,color=_NAVY); pc.alignment=_AL(horizontal="center"); pc.border=_bd
-        r+=1
-    tcc=ws.cell(row=16,column=8,value="Total"); tcc.font=_F(name=_FONT,size=10,bold=True,color=_WHITE)
-    tcc.fill=_PF("solid",fgColor=_SLATE); tcc.alignment=_AL(horizontal="left",indent=1); tcc.border=_bd
-    tv=ws.cell(row=16,column=9,value="=SUM(I11:I15)"); tv.font=_F(name=_FONT,size=10,bold=True,color=_WHITE)
-    tv.fill=_PF("solid",fgColor=_SLATE); tv.alignment=_AL(horizontal="center"); tv.border=_bd
-    tp=ws.cell(row=16,column=10,value="=I16/I16"); tp.number_format="0.0%"; tp.font=_F(name=_FONT,size=10,bold=True,color=_WHITE)
-    tp.fill=_PF("solid",fgColor=_SLATE); tp.alignment=_AL(horizontal="center"); tp.border=_bd
-    ws.merge_cells("A28:O28"); ws["A28"].value="Top devices by items missing"; ws["A28"].font=_F(name=_FONT,size=12,bold=True,color=_NAVY)
-    bi=_XLImage(bp); sc=760.0/bi.width; bi.width=760; bi.height=int(bi.height*sc); ws.add_image(bi,"A29")
-    wc=wb.create_sheet("By Device"); wc.sheet_view.showGridLines=False
-    headers=["Device","Operating System","Critical","Important","Moderate","Low","App updates","Total","Last scanned"]; widths=[24,26,10,11,11,8,12,10,20]
-    for i,(h,w) in enumerate(zip(headers,widths),start=1):
-        cell=wc.cell(row=1,column=i,value=h); cell.font=_F(name=_FONT,size=10,bold=True,color=_WHITE)
-        cell.fill=_PF("solid",fgColor=_NAVY); cell.alignment=_AL(horizontal="center" if 2<i<9 else "left",vertical="center"); cell.border=_bd
-        wc.column_dimensions[_gcl(i)].width=w
-    wc.row_dimensions[1].height=22
-    for rr,d in enumerate(ranked,start=2):
-        total=d[2]+d[3]+d[4]+d[5]+d[6]; vals=[d[0],d[1],d[2],d[3],d[4],d[5],d[6],total,d[7]]
-        for i,v in enumerate(vals,start=1):
-            cell=wc.cell(row=rr,column=i,value=v); cell.font=_F(name=_FONT,size=10,color=_NAVY)
-            cell.alignment=_AL(horizontal="center" if 2<i<9 else "left"); cell.border=_bd
-            if rr%2==0: cell.fill=_PF("solid",fgColor=_LIGHT)
-        wc.cell(row=rr,column=3).font=_F(name=_FONT,size=10,bold=True,color=_CRIT)
-        wc.cell(row=rr,column=4).font=_F(name=_FONT,size=10,bold=True,color=_IMP)
-    tr=len(ranked)+2
-    for i in range(1,10):
-        cell=wc.cell(row=tr,column=i); cell.fill=_PF("solid",fgColor=_SLATE); cell.font=_F(name=_FONT,bold=True,color=_WHITE)
-        cell.alignment=_AL(horizontal="center" if 2<i<9 else "left"); cell.border=_bd
-    wc.cell(row=tr,column=1,value="TOTAL")
-    for i,cl in enumerate(["C","D","E","F","G","H"],start=3): wc.cell(row=tr,column=i,value="=SUM("+cl+"2:"+cl+str(tr-1)+")")
-    wc.freeze_panes="A2"
-    wd=wb.create_sheet("Detections"); wd.sheet_view.showGridLines=False
-    dh=["Device","OS","Type","KB / App ID","Title","Severity","Released","Fixed / Available","Last scanned"]; dw=[22,18,17,26,40,12,13,20,18]
-    for i,(h,w) in enumerate(zip(dh,dw),start=1):
-        cell=wd.cell(row=1,column=i,value=h); cell.font=_F(name=_FONT,size=10,bold=True,color=_WHITE)
-        cell.fill=_PF("solid",fgColor=_NAVY); cell.alignment=_AL(horizontal="left",vertical="center"); cell.border=_bd
-        wd.column_dimensions[_gcl(i)].width=w
-    wd.row_dimensions[1].height=22
-    for rr,row in enumerate(details,start=2):
-        for i,v in enumerate(row,start=1):
-            cell=wd.cell(row=rr,column=i,value=v); cell.font=_F(name=_FONT,size=9,color=_NAVY)
-            cell.border=_bd; cell.alignment=_AL(horizontal="left",vertical="center")
-            if rr%2==0: cell.fill=_PF("solid",fgColor=_LIGHT)
-        scc=wd.cell(row=rr,column=6); scc.font=_F(name=_FONT,size=9,bold=True,color=_WHITE)
-        scc.fill=_PF("solid",fgColor=_sevc.get(row[5],_SLATE)); scc.alignment=_AL(horizontal="center",vertical="center")
-    wd.freeze_panes="A2"
-    for sh in wb.worksheets:
-        sh.page_setup.orientation="landscape"; sh.page_setup.fitToWidth=1; sh.page_setup.fitToHeight=0
-        sh.sheet_properties.pageSetUpPr=_PSP(fitToPage=True)
-        sh.page_margins.left=0.3; sh.page_margins.right=0.3; sh.page_margins.top=0.4; sh.page_margins.bottom=0.4
-    ws.print_area="A1:K"+str(30+len(topdev)+14)
-    buf=io.BytesIO(); wb.save(buf); buf.seek(0)
-    try: os.remove(dp); os.remove(bp)
-    except Exception: pass
-    return buf
-
-@app.route("/patch-report", methods=["POST"])
-def patch_report():
-    key = os.environ.get("RENDER_KEY")
-    if key and request.headers.get("X-Api-Key") != key:
-        return jsonify(error="unauthorized"), 401
-    body = request.get_json(force=True)
-    customer = body.get("customer", "Client")
-    summary = body.get("summary", [])
-    detections = body.get("detections", [])
-    if not summary:
-        return jsonify(error="no devices provided"), 400
-    buf = build_patch_report(customer, summary, detections)
-    fname = re.sub(r"\W+", "_", customer) + "_patch_report.xlsx"
-    if request.args.get("b64"):
-        return jsonify(filename=fname, dataB64=base64.b64encode(buf.getvalue()).decode())
-    return send_file(buf, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", download_name=fname)
