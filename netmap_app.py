@@ -16,7 +16,7 @@ gateway, DNS and DHCP. Firewalls and domain controllers are highlighted.
 VLAN data is not available from N-central and is layered in later from
 Network Detective (Phase 2).
 """
-import io, re, ipaddress, datetime, subprocess, os, urllib.request
+import io, re, ipaddress, datetime, subprocess, os, urllib.request, base64
 from flask import Flask, request, send_file, jsonify
 from PIL import Image, ImageDraw, ImageFont
 
@@ -125,16 +125,25 @@ def assemble(body):
         dd["managed"] = True
         devices.append(dd)
 
-    # Stale AD (enabled, no login for >= stale_days)
+    # Stale AD (enabled, no login for >= stale_days).
+    # Make can't emit the domain backslash safely in JSON, so it sends the
+    # AD name base64-encoded (name_b64); decode + strip the DOMAIN\ prefix here.
     stale = []
     for a in ad:
         en = a.get("enabled")
         if str(en).lower() != "true":
             continue
         dt = _parse_date(a.get("last"))
-        if dt and (today - dt).days >= stale_days:
-            host = (a.get("name") or "").split("\\")[-1]
-            stale.append((host, str(a.get("last"))))
+        if not (dt and (today - dt).days >= stale_days):
+            continue
+        raw = a.get("name")
+        if not raw and a.get("name_b64"):
+            try:
+                raw = base64.b64decode(a["name_b64"]).decode("utf-8", "ignore")
+            except Exception:
+                raw = ""
+        host = (raw or "").replace("/", "\\").split("\\")[-1]
+        stale.append((host, str(a.get("last"))))
     stale.sort(key=lambda x: x[1])
 
     # Findings
