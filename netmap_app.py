@@ -16,7 +16,8 @@ gateway, DNS and DHCP. Firewalls and domain controllers are highlighted.
 VLAN data is not available from N-central and is layered in later from
 Network Detective (Phase 2).
 """
-import io, re, ipaddress, datetime, subprocess, os, urllib.request, base64
+import io, re, ipaddress, datetime, subprocess, os, urllib.request, base64, json
+from collections import OrderedDict
 from flask import Flask, request, send_file, jsonify
 from PIL import Image, ImageDraw, ImageFont
 
@@ -375,6 +376,89 @@ def brand(png_bytes, logo_url, client, date):
     d.text((CW / 2 - foot_tw / 2, head + H + foot / 2 - 10), CONF, font=f_foot, fill=(255, 255, 255))
     out = io.BytesIO(); canvas.convert("RGB").save(out, "PNG"); out.seek(0)
     return out
+
+# ---------------------------------------------------------------------------
+# Rich-text inventory for the IT Glue "Map Notes" field (kind: Textbox/HTML)
+# ---------------------------------------------------------------------------
+def _host_octet(ip):
+    try:
+        return int(str(ip).split(",")[0].strip().split(".")[-1])
+    except Exception:
+        return 999
+
+def _netkey(sub):
+    try:
+        return (0, int(ipaddress.ip_network(sub).network_address))
+    except Exception:
+        return (1, sub)
+
+def _sublabel(devs):
+    roles = " ".join(d["role"] for d in devs).upper()
+    names = " ".join(d["name"].upper() for d in devs)
+    if "DOMAIN CONTROLLER" in roles or "ORACLE" in roles or "SQL" in roles:
+        return "server / datacenter VLAN"
+    if "LINUX" in roles:
+        return "Linux / appliance VLAN"
+    if names.count("LAPTOP") and len(devs) <= 6:
+        return "VPN / remote pool"
+    return "LAN segment"
+
+def _h(s):
+    return (str(s) if s is not None else "").replace("&", "&amp;").replace(
+        "<", "&lt;").replace(">", "&gt;")
+
+def build_notes_html(client, date, devices, findings, stale):
+    rows = []
+    for d in devices:
+        ip = (d.get("ip") or "").strip()
+        ports = parse_ports(d.get("ports") or d.get("listening_ports"))
+        role = ROLE_NAMES.get(classify(d.get("name"), d.get("class"), ports), "DEVICE")
+        rows.append({"name": d.get("name") or ip or "(unnamed)", "ip": ip or "-",
+                     "role": role, "managed": d.get("managed", True),
+                     "sub": subnet_of(ip) if ip else "no-IP", "octet": _host_octet(ip)})
+    groups = OrderedDict()
+    for r in sorted(rows, key=lambda r: (_netkey(r["sub"] or "z"), r["octet"])):
+        groups.setdefault(r["sub"] or "no-IP", []).append(r)
+
+    ts = 'border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;width:100%"'
+    out = ['<h2>%s &mdash; network inventory</h2>' % _h(client),
+           '<p><em>Source: N-central + Network Glue &middot; %s</em></p>' % _h(date)]
+    if findings:
+        out.append("<p><strong>Findings</strong></p><ul>")
+        out += ["<li>%s</li>" % _h(f) for f in findings]
+        out.append("</ul>")
+    for sub, devs in groups.items():
+        managed = sum(1 for x in devs if x["managed"])
+        out.append('<h3>%s &mdash; %s &middot; %d devices &middot; %d managed</h3>'
+                   % (_h(sub), _h(_sublabel(devs)), len(devs), managed))
+        out.append('<table %s><tr><th align="left">Device</th><th align="left">IP</th>'
+                   '<th align="left">Role</th><th align="left">Managed</th></tr>' % ts)
+        for x in devs:
+            tag = "Agent" if x["managed"] else "Discovered"
+            out.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+                       % (_h(x["name"]), _h(x["ip"]), _h(x["role"]), tag))
+        out.append("</table>")
+    if stale:
+        out.append('<h3>Decommission candidates &mdash; enabled in AD, no login &gt;1&nbsp;yr</h3>')
+        out.append('<table %s><tr><th align="left">Computer</th><th align="left">Last login</th></tr>' % ts)
+        for nm, last in stale:
+            out.append("<tr><td>%s</td><td>%s</td></tr>" % (_h(nm), _h(last)))
+        out.append("</table>")
+    return "".join(out)
+
+@app.route("/notes", methods=["POST"])
+def notes():
+    key = os.environ.get("RENDER_KEY")
+    if key and request.headers.get("X-Api-Key") != key:
+        return jsonify(error="unauthorized"), 401
+    body = request.get_json(force=True)
+    client = body.get("client", "Client")
+    date = body.get("date") or datetime.datetime.now().strftime("%Y-%m-%d")
+    devices, findings, stale = assemble(body)
+    html = build_notes_html(client, date, devices, findings, stale)
+    # Return JSON-string-escaped HTML (no surrounding quotes) so the Make
+    # scenario can drop it straight into a JSON PATCH body between quotes.
+    return app.response_class(json.dumps(html)[1:-1], mimetype="text/plain")
 
 @app.route("/healthz")
 def healthz(): return "ok", 200
