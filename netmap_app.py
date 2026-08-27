@@ -486,5 +486,286 @@ def render():
     return send_file(out, mimetype="image/png",
                      download_name=re.sub(r"\W+", "_", client) + "_network_map.png")
 
+# ===================== TrustPoint Patch & Vulnerability report  (v3.2) =====================
+# Added alongside the network-map service. POST /patch-report (JSON):
+#   { "customer": "...",
+#     "summary":    [ {hostName, os, scanTimeUtc, critical, important, moderate, low, appCount, lastPatched}, ... ],
+#     "detections": [ {hostName, os, itemType, ref, title, severity, releaseDate, available, scanTimeUtc}, ... ] }
+# -> 200 xlsx  (or JSON {filename, dataB64, stats} when called with ?b64=1). X-Api-Key (RENDER_KEY) like /render.
+#
+# v3.2 adds:
+#   * "Last patched" per device (from the device's own Windows Update install history)
+#   * Overdue split: a Windows/MS patch whose releaseDate is older than the 14-day hold
+#     and still missing = OVERDUE ("patching not working"); newer = still in-hold (expected)
+#   * Overdue KPI + alert banner on the Summary sheet
+#   * stats returned in the JSON response so the orchestrator can raise an internal alert
+import tempfile, base64
+import datetime as _dt
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as _plt
+from openpyxl import Workbook as _WB
+from openpyxl.styles import Font as _F, PatternFill as _PF, Alignment as _AL, Border as _BD, Side as _SD
+from openpyxl.utils import get_column_letter as _gcl
+from openpyxl.worksheet.properties import PageSetupProperties as _PSP
+from openpyxl.drawing.image import Image as _XLImage
+
+_NAVY="1F2A44"; _BLUE="2E5BFF"; _SLATE="5B6B8C"
+_CRIT="C0392B"; _IMP="E67E22"; _MOD="F1C40F"; _LOW="27AE60"; _APPC="2E86C1"; _OVER="B03A2E"
+_LIGHT="EEF2FB"; _WHITE="FFFFFF"; _AMBER="FBEEDC"; _FONT="Arial"
+_thin=_SD(style="thin",color="D5DBE8"); _bd=_BD(left=_thin,right=_thin,top=_thin,bottom=_thin)
+_sevc={"Critical":_CRIT,"Important":_IMP,"Moderate":_MOD,"Low":_LOW,"App updates":_APPC}
+
+HOLD_DAYS = 14   # TrustPoint patch policy: 14-day approval hold. Past this + still missing = overdue.
+
+def _hx(c): return "#"+c
+def _i(v):
+    try: return int(float(v))
+    except Exception: return 0
+
+def _patch_parse_date(s):
+    """Parse an ISO date/datetime like '2026-08-13' or '2026-08-13T04:00:00Z'; return date or None."""
+    if not s: return None
+    s=str(s).strip()
+    for fmt in ("%Y-%m-%d","%Y-%m-%dT%H:%M:%SZ","%Y-%m-%dT%H:%M:%S","%Y-%m-%d %H:%M:%S"):
+        try: return _dt.datetime.strptime(s,fmt).date()
+        except Exception: pass
+    try: return _dt.datetime.fromisoformat(s.replace("Z","")).date()
+    except Exception: return None
+
+def _is_overdue(item_type, release_date, today):
+    """A Windows/Microsoft patch released more than HOLD_DAYS ago and still missing is overdue."""
+    if not item_type or "Windows" not in item_type and "Microsoft" not in item_type:
+        return (False, None)
+    d=_patch_parse_date(release_date)
+    if not d: return (False, None)
+    age=(today-d).days
+    return (age>HOLD_DAYS, age)
+
+def _last_patched_display(iso, today):
+    d=_patch_parse_date(iso)
+    if not d: return ("unknown", None)
+    days=(today-d).days
+    return (d.strftime("%Y-%m-%d")+f"  ({days}d ago)", days)
+
+def _rdonut(sev,total,path):
+    labels=[k for k,v in sev]; vals=[v for k,v in sev]; colors=[_hx(_sevc[k]) for k in labels]
+    fig,ax=_plt.subplots(figsize=(6.4,3.3),dpi=110)
+    w,_=ax.pie(vals if any(vals) else [1],colors=colors if any(vals) else ["#DDDDDD"],startangle=90,counterclock=False,wedgeprops=dict(width=0.42,edgecolor="white",linewidth=1.5))
+    ax.set(aspect="equal")
+    ax.text(0,0,str(total)+"\nitems",ha="center",va="center",fontsize=15,fontweight="bold",color=_hx(_NAVY))
+    leg=[labels[i]+"   "+str(vals[i])+"  ("+(f"{(vals[i]/total*100):.1f}" if total else "0.0")+"%)" for i in range(len(labels))]
+    ax.legend(w[:len(labels)],leg,loc="center left",bbox_to_anchor=(1.0,0.5),frameon=False,fontsize=10.5)
+    _plt.subplots_adjust(left=0.02,right=0.62,top=0.98,bottom=0.02)
+    fig.savefig(path,dpi=110,facecolor="white"); _plt.close(fig)
+
+def _rbars(topdev,path):
+    names=[d[0] for d in topdev][::-1]; totals=[d[2]+d[3]+d[4]+d[5]+d[6] for d in topdev][::-1]; n=len(names)
+    fig,ax=_plt.subplots(figsize=(9.2,max(1.6,0.46*n+0.7)),dpi=110)
+    ax.barh(range(n),totals,color=_hx(_BLUE),height=0.62)
+    ax.set_yticks(range(n)); ax.set_yticklabels(names,fontsize=10.5,color=_hx(_NAVY)); ax.tick_params(axis="y",length=0)
+    ax.tick_params(axis="x",labelsize=9,colors=_hx(_SLATE))
+    for s in ("top","right","left"): ax.spines[s].set_visible(False)
+    ax.spines["bottom"].set_color(_hx("D5DBE8")); mx=max(totals) if totals else 1; ax.set_xlim(0,mx*1.12)
+    for i,v in enumerate(totals): ax.text(v+mx*0.015,i,str(v),va="center",ha="left",fontsize=9.5,color=_hx(_NAVY))
+    _plt.subplots_adjust(left=0.28,right=0.98,top=0.98,bottom=0.14)
+    fig.savefig(path,dpi=110,facecolor="white"); _plt.close(fig)
+
+def build_patch_report(customer, summary, detections):
+    today=_dt.date.today()
+    report_date=_dt.datetime.now().strftime("%B %d, %Y")
+
+    # ---- overdue per host (from detections) ----
+    overdue_by_host={}
+    overdue_total=0; oldest_overdue_days=0
+    det_overdue_flags=[]   # parallel to detections order below
+    for d in detections:
+        od,age=_is_overdue(d.get("itemType",""), d.get("releaseDate",""), today)
+        det_overdue_flags.append((od,age))
+        if od:
+            h=d.get("hostName","")
+            overdue_by_host[h]=overdue_by_host.get(h,0)+1
+            overdue_total+=1
+            if age and age>oldest_overdue_days: oldest_overdue_days=age
+
+    # ---- devices (summary) with last-patched + overdue count ----
+    devices=[]
+    lp_known_days=[]; lp_unknown=0
+    for s in summary:
+        host=s.get("hostName","")
+        lp_disp,lp_days=_last_patched_display(s.get("lastPatched",""), today)
+        if lp_days is None: lp_unknown+=1
+        else: lp_known_days.append((host,lp_days))
+        devices.append([host, s.get("os",""), _i(s.get("critical")), _i(s.get("important")),
+                        _i(s.get("moderate")), _i(s.get("low")), _i(s.get("appCount")),
+                        overdue_by_host.get(host,0), lp_disp, s.get("scanTimeUtc","")])
+
+    details=[]
+    for idx,d in enumerate(detections):
+        od,age=det_overdue_flags[idx]
+        details.append([d.get("hostName",""), d.get("os",""), d.get("itemType",""), d.get("ref",""),
+                        d.get("title",""), d.get("severity","Unspecified") or "Unspecified",
+                        d.get("releaseDate","") or "", ("YES" if od else ""),
+                        d.get("available","") or "", d.get("scanTimeUtc","")])
+
+    tc=sum(d[2] for d in devices); ti=sum(d[3] for d in devices); tm=sum(d[4] for d in devices)
+    tl=sum(d[5] for d in devices); ta=sum(d[6] for d in devices); tall=tc+ti+tm+tl+ta
+    devices_overdue=sum(1 for h,c in overdue_by_host.items() if c>0)
+    ranked=sorted(devices,key=lambda d:(d[7]*10000)+(d[2]+d[3]+d[4]+d[5]+d[6]),reverse=True)  # overdue first
+    sev=[("Critical",tc),("Important",ti),("Moderate",tm),("Low",tl),("App updates",ta)]
+    topdev=ranked[:12]
+
+    stats={
+        "overdueTotal":overdue_total, "devicesOverdue":devices_overdue,
+        "oldestOverdueDays":oldest_overdue_days, "devicesScanned":len(devices),
+        "totalMissing":tall, "critical":tc, "important":ti,
+        "lastPatchedUnknown":lp_unknown,
+        "oldestLastPatchedDays":(max((d for _,d in lp_known_days), default=0)),
+        "oldestLastPatchedHost":(max(lp_known_days, key=lambda x:x[1])[0] if lp_known_days else ""),
+    }
+
+    dp=tempfile.NamedTemporaryFile(suffix=".png",delete=False).name
+    bp=tempfile.NamedTemporaryFile(suffix=".png",delete=False).name
+    _rdonut(sev,tall,dp); _rbars(topdev if topdev else [["(no devices)","",0,0,0,0,0,0,"",""]],bp)
+
+    wb=_WB(); ws=wb.active; ws.title="Summary"; ws.sheet_view.showGridLines=False
+    for c in range(1,16): ws.column_dimensions[_gcl(c)].width=11
+    ws.merge_cells("A1:O2"); t=ws["A1"]; t.value=customer+"  -  Patch & Vulnerability Report"
+    t.font=_F(name=_FONT,size=18,bold=True,color=_WHITE); t.alignment=_AL(horizontal="left",vertical="center",indent=1)
+    for row in ws["A1:O2"]:
+        for cell in row: cell.fill=_PF("solid",fgColor=_NAVY)
+    ws.merge_cells("A3:O3"); s=ws["A3"]
+    s.value="Week of "+report_date+"    -    Source: on-device Windows Update + winget scan (machine-sourced, accurate)"
+    s.font=_F(name=_FONT,size=10,italic=True,color=_SLATE); s.alignment=_AL(horizontal="left",indent=1)
+
+    kpis=[("Devices scanned",len(devices),_BLUE),("Total missing",tall,_NAVY),("Critical",tc,_CRIT),
+          ("Important",ti,_IMP),("App updates",ta,_APPC),("Overdue (>%dd)"%HOLD_DAYS,overdue_total,_OVER)]
+    col=1
+    for label,val,color in kpis:
+        ws.merge_cells(start_row=5,start_column=col,end_row=5,end_column=col+1)
+        ws.merge_cells(start_row=6,start_column=col,end_row=7,end_column=col+1)
+        lc=ws.cell(row=5,column=col,value=label); lc.font=_F(name=_FONT,size=9,bold=True,color=_WHITE); lc.alignment=_AL(horizontal="center")
+        vc=ws.cell(row=6,column=col,value=val); vc.font=_F(name=_FONT,size=22,bold=True,color=_WHITE); vc.alignment=_AL(horizontal="center",vertical="center")
+        for r in (5,6,7):
+            for cc in (col,col+1): ws.cell(row=r,column=cc).fill=_PF("solid",fgColor=color)
+        col+=2
+
+    # ---- overdue / all-clear banner (row 8) ----
+    ws.merge_cells("A8:O8"); bn=ws["A8"]
+    if overdue_total>0:
+        bn.value=("  ATTENTION: %d approved patch(es) on %d device(s) are past the %d-day hold and still missing "
+                  "- patching may not be completing. See 'By Device' (Overdue column) and 'Detections' (Overdue = YES).") % (overdue_total,devices_overdue,HOLD_DAYS)
+        bn.font=_F(name=_FONT,size=10,bold=True,color=_OVER); bn.fill=_PF("solid",fgColor=_AMBER)
+    else:
+        bn.value="  All missing patches are within the %d-day approval hold - nothing overdue. Patching is current." % HOLD_DAYS
+        bn.font=_F(name=_FONT,size=10,bold=True,color=_LOW); bn.fill=_PF("solid",fgColor=_LIGHT)
+    bn.alignment=_AL(horizontal="left",vertical="center")
+
+    ws.merge_cells("A10:E10"); ws["A10"].value="Missing items by severity"; ws["A10"].font=_F(name=_FONT,size=12,bold=True,color=_NAVY)
+    ws.merge_cells("H10:J10"); ws["H10"].value="Breakdown"; ws["H10"].font=_F(name=_FONT,size=12,bold=True,color=_NAVY)
+    im=_XLImage(dp); im.width=470; im.height=242; ws.add_image(im,"A11")
+    for i,h in enumerate(["Severity","Count","Share"],start=8):
+        cell=ws.cell(row=11,column=i,value=h); cell.font=_F(name=_FONT,size=10,bold=True,color=_WHITE)
+        cell.fill=_PF("solid",fgColor=_NAVY); cell.alignment=_AL(horizontal="center"); cell.border=_bd
+    r=12
+    for k,v in sev:
+        kc=ws.cell(row=r,column=8,value=k); kc.font=_F(name=_FONT,size=10,bold=True,color=_WHITE)
+        kc.fill=_PF("solid",fgColor=_sevc[k]); kc.alignment=_AL(horizontal="left",indent=1); kc.border=_bd
+        vc=ws.cell(row=r,column=9,value=v); vc.font=_F(name=_FONT,size=10,color=_NAVY); vc.alignment=_AL(horizontal="center"); vc.border=_bd
+        pc=ws.cell(row=r,column=10,value="=I"+str(r)+"/I17"); pc.number_format="0.0%"
+        pc.font=_F(name=_FONT,size=10,color=_NAVY); pc.alignment=_AL(horizontal="center"); pc.border=_bd
+        r+=1
+    tcc=ws.cell(row=17,column=8,value="Total"); tcc.font=_F(name=_FONT,size=10,bold=True,color=_WHITE)
+    tcc.fill=_PF("solid",fgColor=_SLATE); tcc.alignment=_AL(horizontal="left",indent=1); tcc.border=_bd
+    tv=ws.cell(row=17,column=9,value="=SUM(I12:I16)"); tv.font=_F(name=_FONT,size=10,bold=True,color=_WHITE)
+    tv.fill=_PF("solid",fgColor=_SLATE); tv.alignment=_AL(horizontal="center"); tv.border=_bd
+    tp=ws.cell(row=17,column=10,value="=I17/I17"); tp.number_format="0.0%"; tp.font=_F(name=_FONT,size=10,bold=True,color=_WHITE)
+    tp.fill=_PF("solid",fgColor=_SLATE); tp.alignment=_AL(horizontal="center"); tp.border=_bd
+
+    ws.merge_cells("A29:O29"); ws["A29"].value="Top devices (overdue first, then by items missing)"; ws["A29"].font=_F(name=_FONT,size=12,bold=True,color=_NAVY)
+    bi=_XLImage(bp); sc=760.0/bi.width; bi.width=760; bi.height=int(bi.height*sc); ws.add_image(bi,"A30")
+
+    # ---- By Device sheet ----
+    wc=wb.create_sheet("By Device"); wc.sheet_view.showGridLines=False
+    headers=["Device","Operating System","Critical","Important","Moderate","Low","App updates","Total","Overdue (>%dd)"%HOLD_DAYS,"Last patched","Last scanned"]
+    widths=[24,26,10,11,11,8,12,10,13,20,20]
+    for i,(h,w) in enumerate(zip(headers,widths),start=1):
+        cell=wc.cell(row=1,column=i,value=h); cell.font=_F(name=_FONT,size=10,bold=True,color=_WHITE)
+        cell.fill=_PF("solid",fgColor=(_OVER if i==9 else _NAVY)); cell.alignment=_AL(horizontal="center" if 3<=i<=9 else "left",vertical="center"); cell.border=_bd
+        wc.column_dimensions[_gcl(i)].width=w
+    wc.row_dimensions[1].height=22
+    ncols=len(headers)
+    for rr,d in enumerate(ranked,start=2):
+        total=d[2]+d[3]+d[4]+d[5]+d[6]
+        vals=[d[0],d[1],d[2],d[3],d[4],d[5],d[6],total,d[7],d[8],d[9]]  # d[7]=overdue, d[8]=last patched, d[9]=last scanned
+        for i,v in enumerate(vals,start=1):
+            cell=wc.cell(row=rr,column=i,value=v); cell.font=_F(name=_FONT,size=10,color=_NAVY)
+            cell.alignment=_AL(horizontal="center" if 3<=i<=9 else "left"); cell.border=_bd
+            if rr%2==0: cell.fill=_PF("solid",fgColor=_LIGHT)
+        wc.cell(row=rr,column=3).font=_F(name=_FONT,size=10,bold=True,color=_CRIT)
+        wc.cell(row=rr,column=4).font=_F(name=_FONT,size=10,bold=True,color=_IMP)
+        ov=wc.cell(row=rr,column=9)
+        if d[7]>0:
+            ov.font=_F(name=_FONT,size=10,bold=True,color=_WHITE); ov.fill=_PF("solid",fgColor=_OVER)
+        if str(d[8]).startswith("unknown"):
+            wc.cell(row=rr,column=10).font=_F(name=_FONT,size=10,italic=True,color=_SLATE)
+    tr=len(ranked)+2
+    for i in range(1,ncols+1):
+        cell=wc.cell(row=tr,column=i); cell.fill=_PF("solid",fgColor=_SLATE); cell.font=_F(name=_FONT,bold=True,color=_WHITE)
+        cell.alignment=_AL(horizontal="center" if 3<=i<=9 else "left"); cell.border=_bd
+    wc.cell(row=tr,column=1,value="TOTAL")
+    for i,cl in enumerate(["C","D","E","F","G","H","I"],start=3): wc.cell(row=tr,column=i,value="=SUM("+cl+"2:"+cl+str(tr-1)+")")
+    wc.freeze_panes="A2"
+
+    # ---- Detections sheet ----
+    wd=wb.create_sheet("Detections"); wd.sheet_view.showGridLines=False
+    dh=["Device","OS","Type","KB / App ID","Title","Severity","Released","Overdue?","Fixed / Available","Last scanned"]; dw=[22,18,17,26,40,12,13,10,20,18]
+    for i,(h,w) in enumerate(zip(dh,dw),start=1):
+        cell=wd.cell(row=1,column=i,value=h); cell.font=_F(name=_FONT,size=10,bold=True,color=_WHITE)
+        cell.fill=_PF("solid",fgColor=_NAVY); cell.alignment=_AL(horizontal="left",vertical="center"); cell.border=_bd
+        wd.column_dimensions[_gcl(i)].width=w
+    wd.row_dimensions[1].height=22
+    # overdue first, then by severity weight
+    _sevorder={"Critical":0,"Important":1,"Moderate":2,"Low":3,"Unspecified":4}
+    details_sorted=sorted(details,key=lambda r:(0 if r[7]=="YES" else 1, _sevorder.get(r[5],9)))
+    for rr,row in enumerate(details_sorted,start=2):
+        for i,v in enumerate(row,start=1):
+            cell=wd.cell(row=rr,column=i,value=v); cell.font=_F(name=_FONT,size=9,color=_NAVY)
+            cell.border=_bd; cell.alignment=_AL(horizontal="left",vertical="center")
+            if rr%2==0: cell.fill=_PF("solid",fgColor=_LIGHT)
+        scc=wd.cell(row=rr,column=6); scc.font=_F(name=_FONT,size=9,bold=True,color=_WHITE)
+        scc.fill=_PF("solid",fgColor=_sevc.get(row[5],_SLATE)); scc.alignment=_AL(horizontal="center",vertical="center")
+        if row[7]=="YES":
+            oc=wd.cell(row=rr,column=8); oc.font=_F(name=_FONT,size=9,bold=True,color=_WHITE)
+            oc.fill=_PF("solid",fgColor=_OVER); oc.alignment=_AL(horizontal="center",vertical="center")
+    wd.freeze_panes="A2"
+
+    for sh in wb.worksheets:
+        sh.page_setup.orientation="landscape"; sh.page_setup.fitToWidth=1; sh.page_setup.fitToHeight=0
+        sh.sheet_properties.pageSetUpPr=_PSP(fitToPage=True)
+        sh.page_margins.left=0.3; sh.page_margins.right=0.3; sh.page_margins.top=0.4; sh.page_margins.bottom=0.4
+    ws.print_area="A1:O"+str(31+len(topdev)+14)
+    buf=io.BytesIO(); wb.save(buf); buf.seek(0)
+    try: os.remove(dp); os.remove(bp)
+    except Exception: pass
+    return buf, stats
+
+@app.route("/patch-report", methods=["POST"])
+def patch_report():
+    key = os.environ.get("RENDER_KEY")
+    if key and request.headers.get("X-Api-Key") != key:
+        return jsonify(error="unauthorized"), 401
+    body = request.get_json(force=True)
+    customer = body.get("customer", "Client")
+    summary = body.get("summary", [])
+    detections = body.get("detections", [])
+    if not summary:
+        return jsonify(error="no devices provided"), 400
+    buf, stats = build_patch_report(customer, summary, detections)
+    fname = re.sub(r"\W+", "_", customer) + "_patch_report.xlsx"
+    if request.args.get("b64"):
+        return jsonify(filename=fname, dataB64=base64.b64encode(buf.getvalue()).decode(), stats=stats)
+    return send_file(buf, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", download_name=fname)
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
